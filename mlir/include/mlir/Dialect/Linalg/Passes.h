@@ -18,9 +18,9 @@
 #include "mlir/Pass/Pass.h"
 
 namespace mlir {
-namespace func {
-class FuncOp;
-} // namespace func
+namespace linalg {
+std::unique_ptr<Pass> createFTPPackingPass();
+} // namespace linalg
 
 #define GEN_PASS_DECL
 #include "mlir/Dialect/Linalg/Passes.h.inc" // IWYU pragma: keep

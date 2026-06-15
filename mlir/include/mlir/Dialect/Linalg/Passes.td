@@ -240,4 +240,47 @@ def LinalgBlockPackMatmul : Pass<"linalg-block-pack-matmul"> {
   ];
 }
 
+
+// ============================================================
+// ADD THIS BLOCK to:
+//   mlir/include/mlir/Dialect/Linalg/Transforms/Passes.td
+//
+// Place it alongside the other Linalg transform pass definitions,
+// e.g. after the definition of "LinalgElementwiseOpFusion".
+// ============================================================
+
+def FTPPacking : Pass<"ftp-packing", "func::FuncOp"> {
+  let summary = "Fully Temporal-Parallel (FTP) matmul packing for SNNs";
+  let description = [{
+    Detects groups of linalg.matmul operations that share the same weight
+    (RHS) operand across multiple SNN timesteps and fuses them into a single
+    batched matmul followed by a reduce-sum over the timestep dimension.
+
+    This implements the FTP dataflow from the LoAS paper (Yin et al., 2024):
+      "LoAS: Fully Temporal-Parallel Dataflow for Dual-Sparse SNNs"
+
+    The pass identifies spike-producing matmuls (where the LHS traces back
+    to a uitofp of a threshold comparison) and replaces the sequential chain:
+      for t: out[t] = spike[t] @ W + bias  ->  acc += out[t]
+    with a single batched operation:
+      stacked = concat(spike[0..T-1])   // (T, K)
+      all_out = stacked @ W             // (T, N)
+      result  = reduce_sum(all_out + bias, dim=0)  // (1, N)
+
+    This eliminates T-1 redundant matmul kernel launches and enables the
+    underlying BLAS/accelerator to exploit the full (T,K)x(K,N) problem size.
+  }];
+
+  let constructor = "mlir::linalg::createFTPPackingPass()";
+
+  let dependentDialects = [
+    "func::FuncDialect",
+    "linalg::LinalgDialect",
+    "tensor::TensorDialect",
+    "arith::ArithDialect",
+    "affine::AffineDialect"
+  ];
+
+  // No options currently; T is inferred automatically.
+}
 #endif // MLIR_DIALECT_LINALG_PASSES

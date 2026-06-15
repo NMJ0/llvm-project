@@ -84,6 +84,7 @@ add_mlir_library(MLIRMlirOptMain
 mlir_target_link_libraries(MLIRMlirOptMain PUBLIC
   ${LIBS}
   ${test_libs}
+  MLIRLinalgTransforms
   )
 
 add_mlir_tool(mlir-opt
