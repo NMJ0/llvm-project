@@ -1,44 +1,14 @@
 //===- FTPPacking.cpp - Fully Temporal-Parallel matmul packing pass -------===//
 //
-// This file implements the FTPPacking pass, which detects groups of
-// linalg.matmul operations that share the same weight (RHS) operand across
-// multiple SNN timesteps and fuses them into a single batched matmul.
-//
-// Motivation (LoAS paper, Algorithm 1):
-//   Standard SNN unrolled loop produces T sequential matmuls:
-//     for t in [0,T):  O[t] = spike[t] @ W    (then bias, accumulate)
-//   FTP insight: place t-dim at innermost of IP dataflow, parallelize:
-//     O_all = stack(spike[0..T-1]) @ W         (one (T,K)@(K,N) matmul)
-//     result = reduce_sum(bias(O_all), dim=0)
-//
-// Detection heuristic (generic SNN, any T, any layer size):
-//   1. Group all linalg.matmul ops by their RHS (weight) Value.
-//   2. Retain groups of size >= 2 where each LHS is a spike tensor,
-//      identified by tracing: LHS <- linalg.generic(uitofp) <- linalg.generic
-//      (cmpf oge, producing i1).  This is the standard MLIR lowering of the
-//      LIF threshold comparison.
-//   3. For each such group, emit the FTP replacement and erase the originals.
-//
-// Transformation:
-//   Given group [mm_0, mm_1, ..., mm_{T-1}] sharing RHS=W:
-//   a) Stack LHS:  stacked = insert_slice(spike[0..T-1]) : (T,K)
-//   b) Batch matmul: out_all = linalg.matmul(stacked, W) : (T,N)
-//   c) Bias broadcast (optional): if all mm_i share same bias B,
-//      biased = linalg.generic(out_all + B) : (T,N)
-//   d) Reduce-sum: reduced = linalg.generic(biased, reduction over dim 0)
-//      : (1,N)
-//   e) Replace uses of the final accumulate-chain result with `reduced`.
-//   f) Erase: accumulate generics, bias-add generics, original matmuls
-//      (in that order, to satisfy SSA def-use constraints).
+// Updated to robustly support arbitrary spatial pooling and flattening
+// prior to the FC layer by removing strict `uitofp` origin checks.
+// Extended to pack `linalg.conv_2d_nchw_fchw` convolutions over time.
+// Extended to pack `linalg.pooling_nchw_sum` poolings over time.
 //
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Linalg/Passes.h"
-
-// Required by Passes.h.inc: affine::AffineDialect is referenced in the
-// generated getDependentDialects() body.
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -48,210 +18,77 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/Pass.h"
-
 #include "llvm/ADT/MapVector.h"
-#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "ftp-packing"
 
-namespace mlir {
-namespace linalg {
-
-#define GEN_PASS_DEF_FTPPACKING
-#include "mlir/Dialect/Linalg/Passes.h.inc"
-
-} // namespace linalg
-} // namespace mlir
-
 using namespace mlir;
 using namespace mlir::linalg;
+
+namespace {
 
 //===----------------------------------------------------------------------===//
 // Helper utilities
 //===----------------------------------------------------------------------===//
 
-namespace {
-
-/// Return true when \p op is a linalg.generic that implements a pointwise
-/// binary addition over its two inputs and one output.
-///
-/// The pattern covers both the bias-add and the timestep accumulate step:
-///   iterator_types = all "parallel"
-///   body           = { %r = arith.addf %in0, %in1 ; linalg.yield %r }
-/// The indexing maps are intentionally not checked here because they differ
-/// between the bias-add (#map / #map1 / #map) and the accumulate (#map * 3).
-static bool isAddGeneric(linalg::GenericOp op) {
-  if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1)
-    return false;
-  // Every iterator must be parallel.
-  for (Attribute attr : op.getIteratorTypes())
-    if (cast<linalg::IteratorTypeAttr>(attr).getValue() !=
-        utils::IteratorType::parallel)
-      return false;
-  // Body: exactly two ops — arith.addf + linalg.yield.
-  Block &body = op.getRegion().front();
-  if (body.getOperations().size() != 2)
-    return false;
-  auto addOp = dyn_cast<arith::AddFOp>(&body.front());
-  if (!addOp)
-    return false;
-  auto yieldOp = dyn_cast<linalg::YieldOp>(body.back());
-  if (!yieldOp || yieldOp.getValues().size() != 1 ||
-      yieldOp.getValues()[0] != addOp.getResult())
-    return false;
-  return true;
-}
-
-/// Trace back through the def-use chain to determine whether \p val is a
-/// spike tensor — i.e., the output of a linalg.generic that converts i1->f32
-/// via uitofp (or extui for some lowerings).
-///
-/// Standard LIF lowering pattern in MLIR:
-///   %cmp   = linalg.generic { cmpf oge } ins(%membrane) -> tensor<...xi1>
-///   %spike = linalg.generic { uitofp   } ins(%cmp)      -> tensor<...xf32>
-///
-/// The function also accepts an optional mulf scaling layer on top (some
-/// lowerings compute spike * vth as a separate generic before the soft-reset
-/// subtraction — but the matmul LHS is always the unscaled spike_f).
-static bool isSpikeValue(Value val) {
-  auto *defOp = val.getDefiningOp();
-  if (!defOp)
-    return false;
-
-  auto gen = dyn_cast<linalg::GenericOp>(defOp);
-  if (!gen)
-    return false;
-
-  Block &body = gen.getRegion().front();
-  if (body.getOperations().size() != 2)
-    return false;
-
-  // Primary case: i1 -> f32 via uitofp.
-  if (isa<arith::UIToFPOp>(body.front()))
-    return true;
-
-  // Alternative: i1 -> integer via extui (some pipeline variants).
-  if (isa<arith::ExtUIOp>(body.front()))
-    return true;
-
-  // Secondary case: allow a mulf scaling layer whose first input is itself
-  // a spike (handles rare lowerings that scale before passing to matmul).
-  if (isa<arith::MulFOp>(body.front()) && gen.getNumDpsInputs() >= 1)
-    return isSpikeValue(gen.getDpsInputs()[0]);
-
-  return false;
-}
-
-/// If the first user of \p matmulResult that is an add-generic also has a
-/// 1-D second input, that second input is the bias vector.  Returns
-/// {true, biasValue} on success, {false, {}} otherwise.
-static std::pair<bool, Value> detectBiasAdd(Value matmulResult) {
-  for (Operation *user : matmulResult.getUsers()) {
-    auto gen = dyn_cast<linalg::GenericOp>(user);
-    if (!gen || !isAddGeneric(gen))
-      continue;
-    // One input must be matmulResult; the other is the candidate bias.
-    Value other;
-    for (Value inp : gen.getDpsInputs())
-      if (inp != matmulResult)
-        other = inp;
-    if (!other)
-      continue;
-    // Bias is 1-D, matmul output is 2-D.
-    auto otherType = dyn_cast<RankedTensorType>(other.getType());
-    auto selfType  = dyn_cast<RankedTensorType>(matmulResult.getType());
-    if (otherType && selfType &&
-        otherType.getRank() == 1 && selfType.getRank() == 2)
-      return {true, other};
+/// Sorts the block topologically to resolve any SSA dominance violations
+/// introduced by batching operations across unrolled timesteps.
+static void sortBlockTopologically(Block *block) {
+  SmallVector<Operation*> ops;
+  for (auto &op : *block) {
+    if (!isa<func::ReturnOp>(op))
+      ops.push_back(&op);
   }
-  return {false, Value{}};
-}
 
-/// Walk the accumulate chain that chains together per-timestep biased outputs:
-///
-///   acc[0] = addf(zero_init,  biased[0])
-///   acc[1] = addf(acc[0],     biased[1])
-///   ...
-///   acc[T-1] = addf(acc[T-2], biased[T-1])   <- returned value
-///
-/// \p biasedOutputs must be in program order (timestep 0 first).
-/// On success, \p accumOps is filled in the same order and the function
-/// returns acc[T-1].  Returns a null Value if the chain cannot be found.
-static Value
-findFinalAccumulate(ArrayRef<Value> biasedOutputs,
-                    SmallVectorImpl<linalg::GenericOp> &accumOps) {
-  Value curAcc; // null until first accumulate op is found
-  for (Value biased : biasedOutputs) {
-    bool found = false;
-    for (Operation *user : biased.getUsers()) {
-      auto gen = dyn_cast<linalg::GenericOp>(user);
-      if (!gen || !isAddGeneric(gen))
-        continue;
-      // gen must consume `biased` as one of its inputs.
-      bool usesBiased = false;
-      for (Value inp : gen.getDpsInputs())
-        if (inp == biased)
-          usesBiased = true;
-      if (!usesBiased)
-        continue;
-      // If we already have a previous accumulator it must be the other input.
-      if (curAcc) {
-        bool usesCurAcc = false;
-        for (Value inp : gen.getDpsInputs())
-          if (inp == curAcc)
-            usesCurAcc = true;
-        if (!usesCurAcc)
-          continue;
+  llvm::DenseSet<Operation*> scheduled;
+  Operation* insertPoint = nullptr;
+  bool changed = true;
+ 
+  while (changed) {
+    changed = false;
+    for (Operation *op : ops) {
+      if (scheduled.count(op)) continue;
+     
+      bool ready = true;
+      for (Value operand : op->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (def && def->getBlock() == block && !scheduled.count(def)) {
+          ready = false; break;
+        }
       }
-      accumOps.push_back(gen);
-      curAcc = gen.getResult(0);
-      found  = true;
-      break;
+     
+      if (ready) {
+        if (insertPoint) op->moveAfter(insertPoint);
+        else op->moveBefore(block, block->begin());
+       
+        insertPoint = op;
+        scheduled.insert(op);
+        changed = true;
+      }
     }
-    if (!found)
-      return {}; // chain broken — bail out
   }
-  return curAcc;
 }
 
 //===----------------------------------------------------------------------===//
-// MatmulGroup: T matmuls that share the same weight (RHS)
+// Matmul Grouping
 //===----------------------------------------------------------------------===//
 
 struct MatmulGroup {
-  Value sharedRHS;                         ///< Common weight across timesteps.
-  SmallVector<linalg::MatmulOp> matmuls;   ///< Matmul ops, program order.
-  SmallVector<Value>            lhsSpikes; ///< Spike LHS per timestep.
-  bool  hasBias = false;
-  Value bias;                              ///< Shared bias vector (if hasBias).
-  SmallVector<linalg::GenericOp> biasOps; ///< Bias-add after each matmul.
-  SmallVector<linalg::GenericOp> accumOps;///< Timestep accumulate chain.
-  Value finalAcc;                          ///< Result of last accumulate op.
+  Value sharedRHS;
+  SmallVector<linalg::MatmulOp> matmuls;
+  SmallVector<Value> lhsVals;
+  bool hasBias = false;
+  Value bias;
+  SmallVector<linalg::GenericOp> biasOps;
 
   int64_t T() const { return static_cast<int64_t>(matmuls.size()); }
-  int64_t K() const {
-    return cast<RankedTensorType>(lhsSpikes[0].getType()).getDimSize(1);
-  }
-  int64_t N() const {
-    return cast<RankedTensorType>(sharedRHS.getType()).getDimSize(1);
-  }
+  int64_t K() const { return cast<RankedTensorType>(lhsVals[0].getType()).getDimSize(1); }
+  int64_t N() const { return cast<RankedTensorType>(sharedRHS.getType()).getDimSize(1); }
 };
 
-//===----------------------------------------------------------------------===//
-// collectMatmulGroups
-//===----------------------------------------------------------------------===//
-
-/// Walk the function and return one MatmulGroup per distinct weight Value that
-/// is used as the RHS of >= 2 linalg.matmul ops whose LHS values are spikes.
-///
-/// llvm::MapVector preserves insertion order so that groups are processed in
-/// program order — important for determinism in multi-layer SNNs.
-static SmallVector<MatmulGroup, 4>
-collectMatmulGroups(func::FuncOp funcOp) {
-  // MapVector: insertion order == walk (program) order for the first matmul
-  // encountered with each weight.  Subsequent matmuls for the same weight are
-  // appended to the vector in walk order, so per-group order is also correct.
+static SmallVector<MatmulGroup, 4> collectMatmulGroups(func::FuncOp funcOp) {
   llvm::MapVector<Value, SmallVector<linalg::MatmulOp>> byRHS;
   funcOp.walk([&](linalg::MatmulOp mm) {
     byRHS[mm.getInputs()[1]].push_back(mm);
@@ -259,315 +96,395 @@ collectMatmulGroups(func::FuncOp funcOp) {
 
   SmallVector<MatmulGroup, 4> groups;
   for (auto &[rhs, mms] : byRHS) {
-    if (mms.size() < 2)
-      continue;
+    if (mms.size() < 2) continue;
 
-    // All LHS values must trace back to spike tensors.
-    SmallVector<Value> spikes;
-    spikes.reserve(mms.size());
-    bool allSpike = true;
+    SmallVector<Value> lhsVals;
+    bool sameShape = true;
+    auto firstLhsTy = cast<RankedTensorType>(mms[0].getInputs()[0].getType());
+   
     for (auto mm : mms) {
       Value lhs = mm.getInputs()[0];
-      if (!isSpikeValue(lhs)) { allSpike = false; break; }
-      spikes.push_back(lhs);
-    }
-    if (!allSpike)
-      continue;
-
-    // All output tensors must share the same (1, N) type.
-    auto outType = cast<RankedTensorType>(mms[0].getResult(0).getType());
-    bool sameShape = true;
-    for (auto mm : mms)
-      if (cast<RankedTensorType>(mm.getResult(0).getType()) != outType) {
-        sameShape = false; break;
+      lhsVals.push_back(lhs);
+      if (cast<RankedTensorType>(lhs.getType()) != firstLhsTy) {
+         sameShape = false;
+         break;
       }
-    if (!sameShape)
-      continue;
+    }
+    if (!sameShape) continue;
+
+    bool hasSharedBias = true;
+    Value sharedBias = nullptr;
+    SmallVector<linalg::GenericOp> biasOps;
+
+    for (auto mm : mms) {
+      bool foundBias = false;
+      for (Operation *user : mm.getResult(0).getUsers()) {
+        auto gen = dyn_cast<linalg::GenericOp>(user);
+        if (!gen || gen.getNumDpsInputs() != 2) continue;
+       
+        auto &body = gen.getRegion().front();
+        if (!isa<arith::AddFOp>(body.front())) continue;
+
+        Value other = (gen.getDpsInputs()[0] == mm.getResult(0)) ? gen.getDpsInputs()[1] : gen.getDpsInputs()[0];
+        auto otherTy = dyn_cast<RankedTensorType>(other.getType());
+       
+        if (otherTy && otherTy.getRank() == 1) {
+           if (!sharedBias) sharedBias = other;
+           if (sharedBias == other) {
+              foundBias = true;
+              biasOps.push_back(gen);
+              break;
+           }
+        }
+      }
+      if (!foundBias) { hasSharedBias = false; break; }
+    }
 
     MatmulGroup grp;
     grp.sharedRHS = rhs;
-    grp.matmuls   = mms;
-    grp.lhsSpikes = spikes;
+    grp.matmuls = mms;
+    grp.lhsVals = lhsVals;
+    grp.hasBias = hasSharedBias;
+    grp.bias = hasSharedBias ? sharedBias : nullptr;
+    grp.biasOps = hasSharedBias ? biasOps : SmallVector<linalg::GenericOp>();
 
-    // Detect bias from the first matmul's immediate user.
-    auto [hasBias, biasVal] = detectBiasAdd(mms[0].getResult(0));
-    grp.hasBias = hasBias;
-    grp.bias    = biasVal;
-
-    // Build the ordered list of "biased outputs" (i.e. the value after the
-    // optional bias-add for each timestep) and collect bias-add ops.
-    SmallVector<Value> biasedOutputs;
-    biasedOutputs.reserve(mms.size());
-    for (auto mm : mms) {
-      Value afterBias = mm.getResult(0);
-      if (hasBias) {
-        for (Operation *user : mm.getResult(0).getUsers()) {
-          auto gen = dyn_cast<linalg::GenericOp>(user);
-          if (!gen || !isAddGeneric(gen))
-            continue;
-          // gen must use this matmul result as an input.
-          bool usesMM = llvm::any_of(gen.getDpsInputs(),
-              [&](Value v){ return v == mm.getResult(0); });
-          if (!usesMM)
-            continue;
-          // One input must be 1-D (the bias).
-          bool has1D = llvm::any_of(gen.getDpsInputs(), [&](Value v) {
-            return v != mm.getResult(0) &&
-                   cast<RankedTensorType>(v.getType()).getRank() == 1;
-          });
-          if (!has1D)
-            continue;
-          grp.biasOps.push_back(gen);
-          afterBias = gen.getResult(0);
-          break;
-        }
-      }
-      biasedOutputs.push_back(afterBias);
-    }
-
-    grp.finalAcc = findFinalAccumulate(biasedOutputs, grp.accumOps);
-    if (!grp.finalAcc)
-      continue; // accumulate chain not found — skip this group
-
-    groups.push_back(std::move(grp));
+    groups.push_back(grp);
   }
   return groups;
 }
 
 //===----------------------------------------------------------------------===//
-// emitFTPReplacement
+// Convolution Grouping
 //===----------------------------------------------------------------------===//
 
-/// Emit the FTP-packed replacement ops for \p grp, inserting before the
-/// first matmul in the group.  Returns the (1,N) Value that semantically
-/// replaces \p grp.finalAcc (i.e. the reduce-sum result).
-static Value emitFTPReplacement(MatmulGroup &grp, OpBuilder &builder,
-                                Location loc) {
-  MLIRContext *ctx = builder.getContext();
-  const int64_t T = grp.T();
-  const int64_t K = grp.K();
-  const int64_t N = grp.N();
+struct ConvGroup {
+  Value sharedFilter;
+  SmallVector<linalg::Conv2DNchwFchwOp> convs;
+  SmallVector<Value> lhsVals;
+  SmallVector<Value> outsVals;
 
-  // ── Step 1: stack T spike tensors (1,K) into one (T,K) tensor ──────────
-  // We thread the result of each insert_slice through as the destination of
-  // the next, so every row is written exactly once before the matmul reads it.
-  Value stacked = tensor::EmptyOp::create(builder,
-      loc, ArrayRef<int64_t>{T, K}, builder.getF32Type());
+  int64_t T() const { return static_cast<int64_t>(convs.size()); }
+  RankedTensorType getLhsType() const { return cast<RankedTensorType>(lhsVals[0].getType()); }
+  RankedTensorType getOutsType() const { return cast<RankedTensorType>(outsVals[0].getType()); }
+};
 
-  for (int64_t t = 0; t < T; ++t) {
-    SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t),
-                                         builder.getIndexAttr(0)};
-    SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1),
-                                         builder.getIndexAttr(K)};
-    SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1),
-                                         builder.getIndexAttr(1)};
-    stacked = tensor::InsertSliceOp::create(builder,
-        loc, grp.lhsSpikes[t], stacked, offsets, sizes, strides);
+static SmallVector<ConvGroup, 4> collectConvGroups(func::FuncOp funcOp) {
+  llvm::MapVector<Value, SmallVector<linalg::Conv2DNchwFchwOp>> byFilter;
+  
+  funcOp.walk([&](linalg::Conv2DNchwFchwOp conv) {
+    byFilter[conv.getInputs()[1]].push_back(conv);
+  });
+
+  SmallVector<ConvGroup, 4> groups;
+  for (auto &[filter, convs] : byFilter) {
+    if (convs.size() < 2) continue;
+
+    SmallVector<Value> lhsVals;
+    SmallVector<Value> outsVals;
+    bool sameShape = true;
+    
+    auto firstLhsTy = cast<RankedTensorType>(convs[0].getInputs()[0].getType());
+    auto firstOutsTy = cast<RankedTensorType>(convs[0].getOutputs()[0].getType());
+
+    if (firstLhsTy.getDimSize(0) != 1) continue;
+
+    for (auto conv : convs) {
+      Value lhs = conv.getInputs()[0];
+      Value outs = conv.getOutputs()[0];
+      lhsVals.push_back(lhs);
+      outsVals.push_back(outs);
+
+      if (cast<RankedTensorType>(lhs.getType()) != firstLhsTy ||
+          cast<RankedTensorType>(outs.getType()) != firstOutsTy) {
+        sameShape = false;
+        break;
+      }
+    }
+    if (!sameShape) continue;
+
+    ConvGroup grp;
+    grp.sharedFilter = filter;
+    grp.convs = convs;
+    grp.lhsVals = lhsVals;
+    grp.outsVals = outsVals;
+    groups.push_back(grp);
   }
-
-  // ── Step 2: single (T,K) @ (K,N) → (T,N) matmul ───────────────────────
-  auto ftpOutType = RankedTensorType::get({T, N}, builder.getF32Type());
-  Value zero = arith::ConstantOp::create(builder,
-      loc, builder.getF32Type(), builder.getF32FloatAttr(0.0f));
-  Value ftpEmpty = tensor::EmptyOp::create(builder,
-      loc, ArrayRef<int64_t>{T, N}, builder.getF32Type());
-  Value ftpZero = linalg::FillOp::create(builder,
-      loc, ValueRange{zero}, ValueRange{ftpEmpty}).getResult(0);
-
-  Value ftpMatmul = linalg::MatmulOp::create(builder,
-      loc, TypeRange{ftpOutType},
-      ValueRange{stacked, grp.sharedRHS},
-      ValueRange{ftpZero}).getResult(0);
-
-  // ── Step 3 (optional): broadcast bias (N,) over T rows → (T,N) ─────────
-  //   Affine maps:
-  //     in0  : (d0, d1) → (d0, d1)   identity for (T,N)
-  //     in1  : (d0, d1) → (d1)       broadcast bias over the t-dim
-  //     out  : (d0, d1) → (d0, d1)
-  Value afterBias = ftpMatmul;
-  if (grp.hasBias && grp.bias) {
-    AffineMap identMap = AffineMap::getMultiDimIdentityMap(2, ctx);
-    AffineMap biasMap =
-        AffineMap::get(2, 0,
-                       SmallVector<AffineExpr>{builder.getAffineDimExpr(1)},
-                       ctx);
-
-    Value biasOut = tensor::EmptyOp::create(builder,
-        loc, ArrayRef<int64_t>{T, N}, builder.getF32Type());
-
-    afterBias = linalg::GenericOp::create(builder,
-        loc, TypeRange{ftpOutType},
-        ValueRange{ftpMatmul, grp.bias},
-        ValueRange{biasOut},
-        ArrayRef<AffineMap>{identMap, biasMap, identMap},
-        ArrayRef<utils::IteratorType>{utils::IteratorType::parallel,
-                                      utils::IteratorType::parallel},
-        [&](OpBuilder &b, Location l, ValueRange args) {
-          linalg::YieldOp::create(b, l,
-              arith::AddFOp::create(b, l, args[0], args[1]).getResult());
-        }).getResult(0);
-  }
-
-  // ── Step 4: reduce-sum over t-dim: (T,N) → (1,N) ───────────────────────
-  //   Affine maps:
-  //     in  : (d0, d1) → (d0, d1)         identity over (T,N)
-  //     out : (d0, d1) → ( 0, d1)         constant 0 on d0 collapses t-dim
-  //   Iterator types: [reduction, parallel]
-  AffineExpr d1 = builder.getAffineDimExpr(1);
-  AffineMap inMap = AffineMap::getMultiDimIdentityMap(2, ctx);
-  AffineMap outMap =
-      AffineMap::get(2, 0,
-                     SmallVector<AffineExpr>{
-                         builder.getAffineConstantExpr(0), d1},
-                     ctx);
-
-  auto reducedType = RankedTensorType::get({1, N}, builder.getF32Type());
-  Value reduceEmpty = tensor::EmptyOp::create(builder,
-      loc, ArrayRef<int64_t>{1, N}, builder.getF32Type());
-  Value reduceZero = linalg::FillOp::create(builder,
-      loc, ValueRange{zero}, ValueRange{reduceEmpty}).getResult(0);
-
-  Value reduced = linalg::GenericOp::create(builder,
-      loc, TypeRange{reducedType},
-      ValueRange{afterBias},
-      ValueRange{reduceZero},
-      ArrayRef<AffineMap>{inMap, outMap},
-      ArrayRef<utils::IteratorType>{utils::IteratorType::reduction,
-                                    utils::IteratorType::parallel},
-      [&](OpBuilder &b, Location l, ValueRange args) {
-        // args[0] = element of (T,N) input
-        // args[1] = current partial sum in (1,N) output
-        linalg::YieldOp::create(b, l,
-            arith::AddFOp::create(b, l, args[0], args[1]).getResult());
-      }).getResult(0);
-
-  return reduced;
+  return groups;
 }
 
 //===----------------------------------------------------------------------===//
-// The pass — runOnOperation
+// Pooling Grouping
 //===----------------------------------------------------------------------===//
 
-struct FTPPackingPass
-    : public mlir::linalg::impl::FTPPackingBase<FTPPackingPass> {
+struct PoolGroup {
+  Value sharedWindow;
+  SmallVector<linalg::PoolingNchwSumOp> pools;
+  SmallVector<Value> lhsVals;
+  SmallVector<Value> outsVals;
+
+  int64_t T() const { return static_cast<int64_t>(pools.size()); }
+  RankedTensorType getLhsType() const { return cast<RankedTensorType>(lhsVals[0].getType()); }
+  RankedTensorType getOutsType() const { return cast<RankedTensorType>(outsVals[0].getType()); }
+};
+
+static SmallVector<PoolGroup, 4> collectPoolGroups(func::FuncOp funcOp) {
+  llvm::MapVector<Value, SmallVector<linalg::PoolingNchwSumOp>> byWindow;
+  
+  funcOp.walk([&](linalg::PoolingNchwSumOp pool) {
+    // Input 1 is the pooling window
+    byWindow[pool.getInputs()[1]].push_back(pool);
+  });
+
+  SmallVector<PoolGroup, 4> groups;
+  for (auto &[window, pools] : byWindow) {
+    
+    // Sub-group by LHS shape to cleanly separate Layer 1 and Layer 2 pools
+    // since they share the identical 2x2 window tensor.
+    llvm::MapVector<Type, SmallVector<linalg::PoolingNchwSumOp>> byShape;
+    for (auto pool : pools) {
+      byShape[pool.getInputs()[0].getType()].push_back(pool);
+    }
+
+    for (auto &[shape, subPools] : byShape) {
+      if (subPools.size() < 2) continue;
+
+      SmallVector<Value> lhsVals;
+      SmallVector<Value> outsVals;
+      bool sameShape = true;
+      
+      auto firstLhsTy = cast<RankedTensorType>(subPools[0].getInputs()[0].getType());
+      auto firstOutsTy = cast<RankedTensorType>(subPools[0].getOutputs()[0].getType());
+
+      if (firstLhsTy.getDimSize(0) != 1) continue;
+
+      for (auto pool : subPools) {
+        Value lhs = pool.getInputs()[0];
+        Value outs = pool.getOutputs()[0];
+        lhsVals.push_back(lhs);
+        outsVals.push_back(outs);
+
+        if (cast<RankedTensorType>(lhs.getType()) != firstLhsTy ||
+            cast<RankedTensorType>(outs.getType()) != firstOutsTy) {
+          sameShape = false;
+          break;
+        }
+      }
+      if (!sameShape) continue;
+
+      PoolGroup grp;
+      grp.sharedWindow = window;
+      grp.pools = subPools;
+      grp.lhsVals = lhsVals;
+      grp.outsVals = outsVals;
+      groups.push_back(grp);
+    }
+  }
+  return groups;
+}
+
+//===----------------------------------------------------------------------===//
+// The pass
+//===----------------------------------------------------------------------===//
+
+struct FTPPackingPass : public PassWrapper<FTPPackingPass, OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FTPPackingPass)
+
+  StringRef getArgument() const final { return "ftp-packing"; }
+  StringRef getDescription() const final { return "Batches SNN matmuls, convolutions, and poolings over unrolled timesteps."; }
 
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
+    SmallVector<MatmulGroup, 4> matmulGroups = collectMatmulGroups(funcOp);
+    SmallVector<ConvGroup, 4> convGroups = collectConvGroups(funcOp);
+    SmallVector<PoolGroup, 4> poolGroups = collectPoolGroups(funcOp);
 
-    // ── 1. Collect spike-matmul groups ────────────────────────────────────
-    SmallVector<MatmulGroup, 4> groups = collectMatmulGroups(funcOp);
-
-    if (groups.empty()) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[ftp-packing] no groups found in '"
-                 << funcOp.getName() << "'\n");
-      return;
-    }
-
-    LLVM_DEBUG(llvm::dbgs()
-               << "[ftp-packing] " << groups.size()
-               << " group(s) in '" << funcOp.getName() << "'\n");
-
+    if (matmulGroups.empty() && convGroups.empty() && poolGroups.empty()) return;
+   
     OpBuilder builder(funcOp.getContext());
 
-    // ── 2. Process each group ─────────────────────────────────────────────
-    for (MatmulGroup &grp : groups) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[ftp-packing]   T=" << grp.T()
-                 << " K=" << grp.K() << " N=" << grp.N()
-                 << " hasBias=" << grp.hasBias << '\n');
+    // ---------------------------------------------------------
+    // 1. Pack Convolutions
+    // ---------------------------------------------------------
+    for (ConvGroup &grp : convGroups) {
+      Operation *insertionPt = grp.convs.back().getOperation();
+      builder.setInsertionPointAfter(insertionPt);
+      Location loc = insertionPt->getLoc();
 
-      // ── Find the correct insertion point ────────────────────────────────
-      // We must insert AFTER the last op that defines any value we consume:
-      // all spike LHS tensors, the shared RHS weight, and the bias (if any).
-      // Inserting before the first matmul is wrong when later spikes are
-      // defined after mm_0 — those values would not yet dominate the use.
-      //
-      // Strategy: collect every defining operation for values we need, then
-      // pick the one that appears latest in the block (i.e. has the highest
-      // index when iterating forward).  Insert immediately after that op.
-      //
-      // All ops in a group must be in the same block (they share a function
-      // body), so block-order comparison via iterators is valid.
-      Block *parentBlock = grp.matmuls[0].getOperation()->getBlock();
+      int64_t T = grp.T();
+      
+      auto lhsTy = grp.getLhsType();
+      int64_t C = lhsTy.getDimSize(1);
+      int64_t H = lhsTy.getDimSize(2);
+      int64_t W = lhsTy.getDimSize(3);
 
-      // Gather all values the replacement will directly consume.
-      SmallVector<Value> neededValues(grp.lhsSpikes.begin(),
-                                      grp.lhsSpikes.end());
-      neededValues.push_back(grp.sharedRHS);
-      if (grp.hasBias && grp.bias)
-        neededValues.push_back(grp.bias);
+      auto outsTy = grp.getOutsType();
+      int64_t F = outsTy.getDimSize(1);
+      int64_t oH = outsTy.getDimSize(2);
+      int64_t oW = outsTy.getDimSize(3);
 
-      // Walk the block once to assign each op a position index, then find
-      // the maximum index among the defining ops of our needed values.
-      // Block::getOperations() returns ops in program order.
-      llvm::DenseMap<Operation *, unsigned> opIndex;
-      unsigned idx = 0;
-      for (Operation &op : parentBlock->getOperations())
-        opIndex[&op] = idx++;
-
-      Operation *lastDef = nullptr;
-      unsigned   lastIdx = 0;
-      for (Value v : neededValues) {
-        Operation *defOp = v.getDefiningOp();
-        if (!defOp)
-          continue; // block argument — always dominates everything
-        auto it = opIndex.find(defOp);
-        if (it == opIndex.end())
-          continue; // defined outside this block — also always dominates
-        if (!lastDef || it->second > lastIdx) {
-          lastDef = defOp;
-          lastIdx = it->second;
-        }
+      // Stack LHS Inputs into [T, C, H, W]
+      Value stackedLhs = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{T, C, H, W}, builder.getF32Type());
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(C), builder.getIndexAttr(H), builder.getIndexAttr(W)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        stackedLhs = builder.create<tensor::InsertSliceOp>(loc, grp.lhsVals[t], stackedLhs, offsets, sizes, strides);
       }
 
-      // If every needed value is a block argument or defined outside the
-      // block, fall back to inserting before the first matmul (safe because
-      // block arguments dominate everything).
-      Operation *insertionPt;
-      if (lastDef)
-        insertionPt = lastDef->getNextNode(); // insert *after* lastDef
-      else
-        insertionPt = grp.matmuls[0].getOperation();
+      // Stack Outs (Biases) into [T, F, oH, oW]
+      Value stackedOuts = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{T, F, oH, oW}, builder.getF32Type());
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(F), builder.getIndexAttr(oH), builder.getIndexAttr(oW)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        stackedOuts = builder.create<tensor::InsertSliceOp>(loc, grp.outsVals[t], stackedOuts, offsets, sizes, strides);
+      }
 
-      builder.setInsertionPoint(insertionPt);
-      Location loc = grp.matmuls[0].getOperation()->getLoc();
+      // Execute Batched Conv
+      auto batchedConvTy = RankedTensorType::get({T, F, oH, oW}, builder.getF32Type());
+      auto batchedConv = builder.create<linalg::Conv2DNchwFchwOp>(
+        loc, TypeRange{batchedConvTy}, ValueRange{stackedLhs, grp.sharedFilter}, ValueRange{stackedOuts}
+      );
+      batchedConv->setAttrs(grp.convs[0]->getAttrs()); // Copy strides/dilations
 
-      // ── 2a. Emit the FTP replacement ops ────────────────────────────────
-      Value newResult = emitFTPReplacement(grp, builder, loc);
+      // Extract slices and replace unrolled ops
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(F), builder.getIndexAttr(oH), builder.getIndexAttr(oW)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        Value slice = builder.create<tensor::ExtractSliceOp>(loc, batchedConv.getResult(0), offsets, sizes, strides);
 
-      // ── 2b. Redirect all downstream uses of the old accumulate result ───
-      grp.finalAcc.replaceAllUsesWith(newResult);
+        grp.convs[t].getResult(0).replaceAllUsesWith(slice);
+        grp.convs[t].erase();
+      }
+    }
 
-      // ── 2c. Erase obsolete ops (SSA requires: users before defs) ────────
-      //   Order: accumulate generics → bias-add generics → matmuls.
-      //   Within each category we erase in reverse program order so that
-      //   each op is erased only after its SSA users have been erased.
+    // ---------------------------------------------------------
+    // 2. Pack Pooling Layers
+    // ---------------------------------------------------------
+    for (PoolGroup &grp : poolGroups) {
+      Operation *insertionPt = grp.pools.back().getOperation();
+      builder.setInsertionPointAfter(insertionPt);
+      Location loc = insertionPt->getLoc();
 
-      for (auto it = grp.accumOps.rbegin(); it != grp.accumOps.rend(); ++it)
-        (*it)->erase();
+      int64_t T = grp.T();
+      
+      auto lhsTy = grp.getLhsType();
+      int64_t C = lhsTy.getDimSize(1);
+      int64_t H = lhsTy.getDimSize(2);
+      int64_t W = lhsTy.getDimSize(3);
 
-      for (auto it = grp.biasOps.rbegin(); it != grp.biasOps.rend(); ++it)
-        (*it)->erase();
+      auto outsTy = grp.getOutsType();
+      int64_t oH = outsTy.getDimSize(2);
+      int64_t oW = outsTy.getDimSize(3);
 
-      for (auto it = grp.matmuls.rbegin(); it != grp.matmuls.rend(); ++it)
-        (*it)->erase();
+      // Stack LHS Inputs into [T, C, H, W]
+      Value stackedLhs = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{T, C, H, W}, builder.getF32Type());
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(C), builder.getIndexAttr(H), builder.getIndexAttr(W)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        stackedLhs = builder.create<tensor::InsertSliceOp>(loc, grp.lhsVals[t], stackedLhs, offsets, sizes, strides);
+      }
+
+      // Stack Outs into [T, C, oH, oW]
+      Value stackedOuts = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{T, C, oH, oW}, builder.getF32Type());
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(C), builder.getIndexAttr(oH), builder.getIndexAttr(oW)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        stackedOuts = builder.create<tensor::InsertSliceOp>(loc, grp.outsVals[t], stackedOuts, offsets, sizes, strides);
+      }
+
+      // Execute Batched Pooling
+      auto batchedPoolTy = RankedTensorType::get({T, C, oH, oW}, builder.getF32Type());
+      auto batchedPool = builder.create<linalg::PoolingNchwSumOp>(
+        loc, TypeRange{batchedPoolTy}, ValueRange{stackedLhs, grp.sharedWindow}, ValueRange{stackedOuts}
+      );
+      batchedPool->setAttrs(grp.pools[0]->getAttrs()); // Copy strides/dilations
+
+      // Extract slices and replace unrolled ops
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(C), builder.getIndexAttr(oH), builder.getIndexAttr(oW)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        Value slice = builder.create<tensor::ExtractSliceOp>(loc, batchedPool.getResult(0), offsets, sizes, strides);
+
+        grp.pools[t].getResult(0).replaceAllUsesWith(slice);
+        grp.pools[t].erase();
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 3. Pack Matmuls
+    // ---------------------------------------------------------
+    for (MatmulGroup &grp : matmulGroups) {
+      Operation *insertionPt = grp.matmuls.back().getOperation();
+      builder.setInsertionPointAfter(insertionPt);
+      Location loc = insertionPt->getLoc();
+
+      int64_t T = grp.T();
+      int64_t K = grp.K();
+      int64_t N = grp.N();
+
+      Value stacked = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{T, K}, builder.getF32Type());
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(K)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        stacked = builder.create<tensor::InsertSliceOp>(loc, grp.lhsVals[t], stacked, offsets, sizes, strides);
+      }
+
+      auto ftpOutType = RankedTensorType::get({T, N}, builder.getF32Type());
+      Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32Type(), builder.getF32FloatAttr(0.0f));
+      Value ftpEmpty = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{T, N}, builder.getF32Type());
+      Value ftpZero = builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{ftpEmpty}).getResult(0);
+
+      Value ftpMatmul = builder.create<linalg::MatmulOp>(loc, TypeRange{ftpOutType}, ValueRange{stacked, grp.sharedRHS}, ValueRange{ftpZero}).getResult(0);
+
+      Value finalBatched = ftpMatmul;
+      if (grp.hasBias) {
+        AffineMap identMap = AffineMap::getMultiDimIdentityMap(2, builder.getContext());
+        AffineMap biasMap = AffineMap::get(2, 0, SmallVector<AffineExpr>{builder.getAffineDimExpr(1)}, builder.getContext());
+        Value biasOut = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{T, N}, builder.getF32Type());
+
+        finalBatched = builder.create<linalg::GenericOp>(
+          loc, TypeRange{ftpOutType}, ValueRange{ftpMatmul, grp.bias}, ValueRange{biasOut},
+          ArrayRef<AffineMap>{identMap, biasMap, identMap},
+          ArrayRef<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::parallel},
+          [&](OpBuilder &b, Location l, ValueRange args) {
+            b.create<linalg::YieldOp>(l, b.create<arith::AddFOp>(l, args[0], args[1]).getResult());
+          }).getResult(0);
+      }
+
+      for (int64_t t = 0; t < T; ++t) {
+        SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(t), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes   = {builder.getIndexAttr(1), builder.getIndexAttr(N)};
+        SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        Value slice = builder.create<tensor::ExtractSliceOp>(loc, finalBatched, offsets, sizes, strides);
+
+        if (grp.hasBias) {
+          grp.biasOps[t].getResult(0).replaceAllUsesWith(slice);
+          grp.biasOps[t].erase();
+        } else {
+          grp.matmuls[t].getResult(0).replaceAllUsesWith(slice);
+        }
+        grp.matmuls[t].erase();
+      }
+    }
+   
+    // 4. Clean up SSA Dominance
+    if (!matmulGroups.empty() || !convGroups.empty() || !poolGroups.empty()) {
+       sortBlockTopologically(&funcOp.getBody().front());
     }
   }
 };
-
-} // end anonymous namespace
-
-//===----------------------------------------------------------------------===//
-// Public pass-creation entry point
-//===----------------------------------------------------------------------===//
+} // end namespace
 
 namespace mlir {
 namespace linalg {
-
 std::unique_ptr<Pass> createFTPPackingPass() {
   return std::make_unique<FTPPackingPass>();
 }
-
-} // namespace linalg
-} // namespace mlir
+}
+}
